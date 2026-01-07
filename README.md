@@ -10,11 +10,13 @@ A web application for conducting asynchronous video interviews where candidates 
 - **Interview Interface**: 
   - Sequential question display
   - Single continuous video recording
-  - Real-time video upload using MediaRecorder API
+  - Real-time video streaming using WebRTC + SFU (Selective Forwarding Unit)
+  - Low-latency, high-quality video transmission
   - Camera and microphone device selection
   - Audio waveform visualization
   - Total duration timer and per-question timers
 - **Backend Storage**: Organized file structure for interview data and videos
+- **WebRTC SFU Server**: Mediasoup-based SFU for efficient media routing
 
 ## Getting Started
 
@@ -35,19 +37,23 @@ yarn install
 pnpm install
 ```
 
-2. Run the development server:
+2. Create a `.env.local` file (optional, defaults work for local development):
+```env
+PORT=3000
+HOST_NAME=localhost
+NEXT_PUBLIC_SFU_URL=http://localhost:3000
+NEXT_PUBLIC_APP_URL=http://localhost:3000
+```
+
+3. Start the development server (runs both Next.js app and SFU server in one process):
 
 ```bash
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-3. Open [http://localhost:3000](http://localhost:3000) in your browser
+4. Open [http://localhost:3000](http://localhost:3000) in your browser
+
+**Note:** The application uses a unified server that runs both the Next.js app and the WebRTC SFU server on the same port (3000 by default). This simplifies development and deployment.
 
 ## Usage
 
@@ -60,7 +66,7 @@ bun dev
 5. Select your camera and microphone devices
 6. Click "Start Recording" when ready
 7. Answer questions sequentially by clicking "Next" to move between questions
-8. The video is uploaded in real-time as you record
+8. The video is streamed in real-time via WebRTC to the SFU server
 9. Click "Stop Recording" when finished
 
 ### File Structure
@@ -71,7 +77,8 @@ The application stores interview data in the following structure:
 /uploads
   /{sessionId}
     - interview.json          # Interview configuration
-    - {username}-{userEmail}.webm  # Candidate video recording
+    - {username} - {useremail} - {timestamp}.mkv  # Candidate video recording (Matroska format)
+    - {username} - {useremail} - {timestamp}.sdp  # SDP file used for FFmpeg recording
 ```
 
 ## API Routes
@@ -89,24 +96,29 @@ Fetches the interview configuration for a given session. If no configuration exi
 }
 ```
 
-### POST `/api/upload`
+### POST `/api/recording/[sessionId]/finalize`
 
-Receives video chunks in real-time and saves them to disk. The final video file is saved as `{username}-{userEmail}.webm` in the session directory.
+Finalizes the recording session after WebRTC streaming is complete.
 
-**Form Data:**
-- `sessionId`: Session identifier
-- `name`: Candidate name (sanitized for filename)
-- `email`: Candidate email (sanitized for filename)
-- `chunk`: Video blob chunk (optional, for chunk uploads)
-- `isFinal`: "true" or "false" (indicates final upload)
+**Body:**
+```json
+{
+  "name": "Candidate Name",
+  "email": "candidate@example.com"
+}
+```
 
 ## Technical Details
 
 ### Recording Technology
 
-- Uses MediaRecorder API with WebM format (VP8 video, Opus audio)
-- Chunks are uploaded every second during recording
-- Real-time streaming ensures data is saved even if connection is interrupted
+- Uses WebRTC for low-latency, high-quality video streaming
+- Mediasoup SFU (Selective Forwarding Unit) for efficient media routing
+- Server-side recording using FFmpeg for reliable video capture
+- Real-time streaming with minimal latency (< 100ms typical)
+- Supports VP8, VP9, and H.264 video codecs
+- Opus audio codec for high-quality audio
+- Matroska (MKV) container format for flexible video recording
 
 ### Browser Requirements
 
@@ -120,20 +132,33 @@ Receives video chunks in real-time and saves them to disk. The final video file 
 interviewly/
 ├── app/
 │   ├── api/
-│   │   ├── interview/[sessionId]/route.ts  # Interview config API
-│   │   └── upload/route.ts                 # Video upload API
-│   ├── session/[sessionId]/page.tsx        # Session page
-│   ├── layout.tsx                          # Root layout
-│   └── page.tsx                            # Landing page
+│   │   ├── interview/[sessionId]/route.ts           # Interview config API
+│   │   └── recording/[sessionId]/finalize/route.ts # Recording finalization
+│   ├── session/[sessionId]/page.tsx                # Session page
+│   ├── layout.tsx                                  # Root layout
+│   └── page.tsx                                    # Landing page
 ├── components/
-│   ├── AudioWaveform.tsx                   # Audio level visualization
-│   ├── CandidateInfoModal.tsx              # Mandatory info modal
-│   ├── InterviewInterface.tsx             # Main interview UI
-│   └── MediaControls.tsx                   # Device selection
-└── uploads/                                # Generated at runtime
+│   ├── AudioWaveform.tsx                           # Audio level visualization
+│   ├── CandidateInfoModal.tsx                     # Mandatory info modal
+│   ├── InterviewInterface.tsx                     # Main interview UI
+│   └── MediaControls.tsx                          # Device selection
+├── lib/
+│   └── webrtc-client.ts                           # WebRTC client wrapper
+├── server.ts                                       # Unified server (Next.js + SFU)
+├── server/
+│   ├── index.ts                                   # SFU server entry point (legacy)
+│   ├── signaling/
+│   │   └── server.ts                              # WebSocket signaling server
+│   ├── sfu/
+│   │   ├── router.ts                              # SFU router management
+│   │   └── worker.ts                              # Mediasoup worker
+│   └── recording/
+│       └── recorder.ts                            # FFmpeg-based recording service
+└── uploads/                                        # Generated at runtime
     └── {sessionId}/
         ├── interview.json
-        └── {username}-{userEmail}.webm
+        ├── {username} - {useremail} - {timestamp}.mkv
+        └── {username} - {useremail} - {timestamp}.sdp
 ```
 
 ## Development
@@ -141,9 +166,14 @@ interviewly/
 ### Building for Production
 
 ```bash
+# Build the Next.js app
 npm run build
+
+# Start the production server (runs both Next.js and SFU)
 npm start
 ```
+
+**Note:** The production server runs both Next.js and the SFU server in a single process, just like development mode.
 
 ### Linting
 
@@ -155,9 +185,15 @@ npm run lint
 
 - Device selection is disabled during recording to prevent interruptions
 - The candidate information modal cannot be dismissed and must be completed
-- Video files are stored in `.webm` format
+- Video files are stored in `.mkv` (Matroska) format for reliable server-side recording
+- Filenames follow the format: `{username} - {useremail} - {timestamp}.mkv`
 - Filenames are sanitized to ensure safe file system storage
 - The application supports multiple concurrent interview sessions
+- The SFU server runs in the same process as the Next.js app (unified server)
+- Recording automatically stops when the client disconnects
+- FFmpeg must be installed on the server for recording to work
+- For production deployment, configure `MEDIASOUP_ANNOUNCED_IP` with your server's public IP
+- WebRTC requires HTTPS in production (or localhost for development)
 
 ## License
 

@@ -4,6 +4,7 @@ import { useState, useEffect, useRef } from "react";
 import MediaControls from "./MediaControls";
 import ThankYouModal from "./ThankYouModal";
 import VolumeMeter from "./VolumeMeter";
+import { WebRTCClient } from "../lib/webrtc-client";
 
 interface InterviewInterfaceProps {
   sessionId: string;
@@ -35,8 +36,7 @@ export default function InterviewInterface({
   const [showThankYouModal, setShowThankYouModal] = useState(false);
 
   const videoRef = useRef<HTMLVideoElement>(null);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const chunksRef = useRef<Blob[]>([]);
+  const webrtcClientRef = useRef<WebRTCClient | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const animationFrameRef = useRef<number | null>(null);
@@ -88,6 +88,9 @@ export default function InterviewInterface({
     initializeMedia();
 
     return () => {
+      if (webrtcClientRef.current) {
+        webrtcClientRef.current.stop().catch(console.error);
+      }
       if (mediaStream) {
         mediaStream.getTracks().forEach((track) => track.stop());
       }
@@ -174,86 +177,74 @@ export default function InterviewInterface({
     if (!mediaStream) return;
 
     try {
-      const mediaRecorder = new MediaRecorder(mediaStream, {
-        mimeType: "video/webm;codecs=vp8,opus",
+      const webrtcClient = new WebRTCClient({
+        sessionId,
+        candidateInfo,
+        onConnected: () => {
+          console.log("✅ WebRTC connected and streaming");
+        },
+        onDisconnected: () => {
+          console.log("❌ WebRTC disconnected");
+        },
+        onError: (error) => {
+          console.error("❌ WebRTC error:", error);
+          const errorMessage = error?.message || error?.toString() || "Unknown WebRTC error";
+          alert(`WebRTC error: ${errorMessage}\n\nMake sure the SFU server is running. You can start it with: npm run dev:sfu`);
+        },
       });
 
-      chunksRef.current = [];
-
-      mediaRecorder.ondataavailable = async (event) => {
-        if (event.data.size > 0) {
-          chunksRef.current.push(event.data);
-          // Upload chunk in real-time
-          await uploadChunk(event.data);
-        }
-      };
-
-      mediaRecorder.onstop = async () => {
-        // Upload final chunk if any
-        if (chunksRef.current.length > 0) {
-          await finalizeUpload();
-        }
-      };
-
-      mediaRecorderRef.current = mediaRecorder;
-      mediaRecorder.start(1000); // Collect data every second
+      await webrtcClient.connect(mediaStream);
+      webrtcClientRef.current = webrtcClient;
       setIsRecording(true);
       setElapsedTime(0);
       setQuestionStartTime(Date.now());
     } catch (err) {
       console.error("Error starting recording:", err);
-      alert("Failed to start recording. Please try again.");
-    }
-  };
-
-  const handleStopRecording = () => {
-    if (mediaRecorderRef.current && isRecording) {
-      mediaRecorderRef.current.stop();
+      const errorMessage = 
+        (err instanceof Error && err.message) || 
+        (typeof err === "string" ? err : "Unknown error");
+      alert(`Failed to start recording: ${errorMessage}\n\nMake sure the SFU server is running. Start it with: npm run dev:sfu`);
       setIsRecording(false);
     }
   };
 
-  const uploadChunk = async (chunk: Blob) => {
-    try {
-      const formData = new FormData();
-      formData.append("chunk", chunk);
-      formData.append("sessionId", sessionId);
-      formData.append("name", candidateInfo.name);
-      formData.append("email", candidateInfo.email);
-      formData.append("isFinal", "false");
-
-      await fetch("/api/upload", {
-        method: "POST",
-        body: formData,
-      });
-    } catch (err) {
-      console.error("Error uploading chunk:", err);
+  const handleStopRecording = async () => {
+    if (webrtcClientRef.current && isRecording) {
+      try {
+        await webrtcClientRef.current.stop();
+        setIsRecording(false);
+        
+        // Finalize recording on server
+        await finalizeRecording();
+        
+        // Show thank you modal after successful recording
+        setShowThankYouModal(true);
+      } catch (err) {
+        console.error("Error stopping recording:", err);
+        alert("There was an error stopping the recording. Please try again.");
+      }
     }
   };
 
-  const finalizeUpload = async () => {
+  const finalizeRecording = async () => {
     try {
-      const formData = new FormData();
-      formData.append("sessionId", sessionId);
-      formData.append("name", candidateInfo.name);
-      formData.append("email", candidateInfo.email);
-      formData.append("isFinal", "true");
-
-      const response = await fetch("/api/upload", {
+      const response = await fetch(`/api/recording/${sessionId}/finalize`, {
         method: "POST",
-        body: formData,
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          name: candidateInfo.name,
+          email: candidateInfo.email,
+        }),
       });
 
-      if (response.ok) {
-        // Show thank you modal after successful upload
-        setShowThankYouModal(true);
-      } else {
-        console.error("Error finalizing upload: Server returned error");
-        alert("There was an error uploading your video. Please try again.");
+      if (!response.ok) {
+        throw new Error("Failed to finalize recording");
       }
     } catch (err) {
-      console.error("Error finalizing upload:", err);
-      alert("There was an error uploading your video. Please try again.");
+      console.error("Error finalizing recording:", err);
+      // Don't show alert here as recording might still be saved
     }
   };
 
