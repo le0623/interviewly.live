@@ -5,15 +5,18 @@ import * as mediasoup from "mediasoup";
 
 export class SignalingServer {
   private routers: Map<string, SFURouter> = new Map();
+  // Use composite key (sessionId:producerId) to allow multiple recorders per session
   private recorders: Map<string, RecordingService> = new Map();
   private pendingRecordingStarts: Map<
     string,
-    { videoProducerId: string; timeout: NodeJS.Timeout }
+    { videoProducerId: string; timeout: NodeJS.Timeout; socketId: string }
   > = new Map();
   // Track socket to session mapping for reliable disconnect handling
   private socketToSessions: Map<string, Set<string>> = new Map();
-  // Store candidateInfo per session (available when joining)
-  private sessionCandidateInfo: Map<string, { name: string; email: string }> = new Map();
+  // Store candidateInfo per socket (not per session, since multiple candidates can use same sessionId)
+  private socketCandidateInfo: Map<string, { name: string; email: string }> = new Map();
+  // Track which socket created which producer for proper matching
+  private producerToSocket: Map<string, string> = new Map();
 
   constructor(
     private io: SocketIOServer,
@@ -39,13 +42,13 @@ export class SignalingServer {
         }
         this.socketToSessions.get(socket.id)!.add(sessionId);
         
-        // Store candidateInfo for this session (available when recording starts)
+        // Store candidateInfo for this socket (not session, since multiple candidates can use same sessionId)
         if (candidateInfo && candidateInfo.name && candidateInfo.email) {
-          this.sessionCandidateInfo.set(sessionId, {
+          this.socketCandidateInfo.set(socket.id, {
             name: candidateInfo.name,
             email: candidateInfo.email,
           });
-          console.log(`📝 Candidate info stored for session ${sessionId}: ${candidateInfo.name} (${candidateInfo.email})`);
+          console.log(`📝 Candidate info stored for socket ${socket.id}: ${candidateInfo.name} (${candidateInfo.email})`);
         }
         
         console.log(`📹 Client ${socket.id} joined session ${sessionId}`);
@@ -140,14 +143,20 @@ export class SignalingServer {
               rtpParameters,
               kind
             );
+            
+            // Track which socket created this producer
+            this.producerToSocket.set(producer.id, socket.id);
 
             // Recording: ensure we capture BOTH video + audio.
             // Video is typically produced first, audio shortly after.
             // If we start FFmpeg immediately on video, we miss audio permanently (SDP has no audio).
-            const tryStartRecording = async (videoProducerId: string) => {
-              // Prevent starting multiple recorders for the same session
-              if (this.recorders.has(sessionId)) {
-                console.log(`⚠️ Recording already exists for session ${sessionId}, skipping`);
+            const tryStartRecording = async (videoProducerId: string, socketId: string) => {
+              // Use composite key to allow multiple recorders per session (different candidates)
+              const recorderKey = `${sessionId}:${videoProducerId}`;
+              
+              // Prevent starting multiple recorders for the same producer
+              if (this.recorders.has(recorderKey)) {
+                console.log(`⚠️ Recording already exists for producer ${videoProducerId} in session ${sessionId}, skipping`);
                 return;
               }
 
@@ -157,15 +166,39 @@ export class SignalingServer {
                 return;
               }
 
-              // Check whether audio exists now.
-              const audioProducerExists =
-                router.getAllProducers().some((p) => p.kind === "audio");
+              // Find audio producer from the same socket/transport
+              // CRITICAL: We must match by socket to avoid mixing audio from different candidates
+              const socketIdForProducer = this.producerToSocket.get(videoProducerId);
+              const allProducers = router.getAllProducers();
+              
+              // Find audio producer created by the same socket
+              let audioProducer: mediasoup.types.Producer | null = null;
+              if (socketIdForProducer) {
+                // Find all producers from this socket
+                const socketProducers = allProducers.filter((p) => 
+                  this.producerToSocket.get(p.id) === socketIdForProducer
+                );
+                audioProducer = socketProducers.find((p) => p.kind === "audio") || null;
+                
+                if (!audioProducer) {
+                  console.log(`ℹ️ No audio producer found yet for socket ${socketIdForProducer} (video producer: ${videoProducerId}). Recording will start without audio and add it when available.`);
+                } else {
+                  console.log(`✅ Found matching audio producer ${audioProducer.id} for socket ${socketIdForProducer} (video: ${videoProducerId})`);
+                }
+              } else {
+                console.warn(`⚠️ Could not determine socket for video producer ${videoProducerId}. Cannot match audio producer.`);
+              }
+              
+              // DO NOT use fallback to first available audio producer - this causes audio mixing!
+              // If we can't match by socket, recording will proceed without audio
+
+              const audioProducerExists = audioProducer !== null;
 
               // If audio doesn't exist yet, we can still start after a short timeout
               // to avoid never recording if audio fails. But prefer starting with audio.
               try {
-                // Get candidateInfo for this session (set when joining)
-                const candidateInfo = this.sessionCandidateInfo.get(sessionId);
+                // Get candidateInfo for this socket (not session, since multiple candidates can use same session)
+                const candidateInfo = this.socketCandidateInfo.get(socketId);
                 
                 const recorder = new RecordingService(
                   sessionId,
@@ -173,27 +206,36 @@ export class SignalingServer {
                   videoProducerInstance,
                   candidateInfo // Pass candidateInfo when creating RecordingService
                 );
+                
+                // Set audio producer if we found it (before calling start)
+                // This ensures the recorder uses the correct audio producer for this specific candidate
+                if (audioProducer) {
+                  recorder.setAudioProducer(audioProducer);
+                }
+                
                 await recorder.start();
-                this.recorders.set(sessionId, recorder);
+                this.recorders.set(recorderKey, recorder);
                 console.log(
-                  `🎬 Recording started for session ${sessionId} (audioPresent=${audioProducerExists}, totalActiveRecordings=${this.recorders.size})`
+                  `🎬 Recording started for session ${sessionId}, producer ${videoProducerId} (socket: ${socketId}, audioPresent=${audioProducerExists}, totalActiveRecordings=${this.recorders.size})`
                 );
               } catch (error) {
-                console.error(`❌ Failed to start recording for session ${sessionId}:`, error);
+                console.error(`❌ Failed to start recording for session ${sessionId}, producer ${videoProducerId}:`, error);
                 // Clean up on failure
-                this.recorders.delete(sessionId);
+                this.recorders.delete(recorderKey);
                 throw error;
               }
             };
 
             if (kind === "video") {
+              // Use composite key to check for existing recorders
+              const recorderKey = `${sessionId}:${producer.id}`;
               // Schedule recording start, giving audio a moment to arrive.
-              if (!this.recorders.has(sessionId) && !this.pendingRecordingStarts.has(sessionId)) {
+              if (!this.recorders.has(recorderKey) && !this.pendingRecordingStarts.has(sessionId)) {
                 const timeout = setTimeout(() => {
                   const pending = this.pendingRecordingStarts.get(sessionId);
                   this.pendingRecordingStarts.delete(sessionId);
                   if (pending) {
-                    tryStartRecording(pending.videoProducerId).catch((e) =>
+                    tryStartRecording(pending.videoProducerId, pending.socketId).catch((e) =>
                       console.error("Error starting recorder (timeout):", e)
                     );
                   }
@@ -201,16 +243,42 @@ export class SignalingServer {
 
                 this.pendingRecordingStarts.set(sessionId, {
                   videoProducerId: producer.id,
+                  socketId: socket.id,
                   timeout,
                 });
               }
             } else if (kind === "audio") {
-              // If video was already produced and we're waiting, start immediately now.
+              // Audio was just produced - check if there's a pending recording start for this socket
+              // Find the pending recording that matches this socket
               const pending = this.pendingRecordingStarts.get(sessionId);
-              if (pending && !this.recorders.has(sessionId)) {
-                clearTimeout(pending.timeout);
-                this.pendingRecordingStarts.delete(sessionId);
-                await tryStartRecording(pending.videoProducerId);
+              if (pending && pending.socketId === socket.id) {
+                const recorderKey = `${sessionId}:${pending.videoProducerId}`;
+                if (!this.recorders.has(recorderKey)) {
+                  // Audio is now available, start recording immediately
+                  clearTimeout(pending.timeout);
+                  this.pendingRecordingStarts.delete(sessionId);
+                  console.log(`🎤 Audio producer ${producer.id} created for socket ${socket.id}, starting recording now`);
+                  await tryStartRecording(pending.videoProducerId, pending.socketId);
+                }
+              } else {
+                // Audio arrived but no pending recording for this socket, or recording already started
+                // Try to find and update the existing recorder
+                const audioProducerInstance = router.getProducer(producer.id);
+                if (audioProducerInstance) {
+                  const socketProducers = Array.from(this.producerToSocket.entries())
+                    .filter(([_, sockId]) => sockId === socket.id)
+                    .map(([prodId]) => prodId);
+                  
+                  for (const videoProdId of socketProducers) {
+                    const recorderKey = `${sessionId}:${videoProdId}`;
+                    const recorder = this.recorders.get(recorderKey);
+                    if (recorder && !(recorder as any).audioProducer) {
+                      // Recorder exists but doesn't have audio yet - set it now
+                      console.log(`🎤 Adding audio producer ${producer.id} to existing recorder for session ${sessionId}, producer ${videoProdId}`);
+                      recorder.setAudioProducer(audioProducerInstance);
+                    }
+                  }
+                }
               }
             }
 
@@ -234,32 +302,50 @@ export class SignalingServer {
         }) => {
           const { sessionId, name, email } = data;
           
-          // Update stored candidateInfo for this session
-          this.sessionCandidateInfo.set(sessionId, { name, email });
+          // Update stored candidateInfo for this socket (not session, since multiple candidates can use same sessionId)
+          this.socketCandidateInfo.set(socket.id, { name, email });
           
           // Also update recorder if it exists (fallback for late updates)
-          const recorder = this.recorders.get(sessionId);
-          if (recorder) {
-            recorder.setCandidateInfo({ name, email });
-            console.log(
-              `📝 Updated candidate info for session ${sessionId}: ${name} (${email})`
-            );
-          } else {
-            console.log(
-              `📝 Candidate info stored for session ${sessionId}: ${name} (${email}) (recorder not yet created)`
-            );
+          // Find recorder for this socket
+          const socketProducers = Array.from(this.producerToSocket.entries())
+            .filter(([_, sockId]) => sockId === socket.id)
+            .map(([producerId]) => producerId);
+          
+          for (const producerId of socketProducers) {
+            const recorderKey = `${sessionId}:${producerId}`;
+            const recorder = this.recorders.get(recorderKey);
+            if (recorder) {
+              recorder.setCandidateInfo({ name, email });
+              console.log(
+                `📝 Updated candidate info for session ${sessionId}, producer ${producerId}: ${name} (${email})`
+              );
+              break;
+            }
           }
+          
+          console.log(
+            `📝 Candidate info stored for socket ${socket.id}, session ${sessionId}: ${name} (${email})`
+          );
         }
       );
 
       socket.on("stop-recording", async (data: { sessionId: string }) => {
         const { sessionId } = data;
-        const recorder = this.recorders.get(sessionId);
-
-        if (recorder) {
-          await recorder.stop();
-          this.recorders.delete(sessionId);
-          socket.emit("recording-stopped", { sessionId });
+        
+        // Find all recorders for this socket in this session
+        const socketProducers = Array.from(this.producerToSocket.entries())
+          .filter(([_, sockId]) => sockId === socket.id)
+          .map(([producerId]) => producerId);
+        
+        for (const producerId of socketProducers) {
+          const recorderKey = `${sessionId}:${producerId}`;
+          const recorder = this.recorders.get(recorderKey);
+          if (recorder) {
+            await recorder.stop();
+            this.recorders.delete(recorderKey);
+            socket.emit("recording-stopped", { sessionId });
+            break; // Stop first recorder found (should only be one per socket)
+          }
         }
       });
 
@@ -299,20 +385,40 @@ export class SignalingServer {
    * This method is called when a client disconnects to ensure recording stops
    */
   private async stopRecordingForSession(sessionId: string, socketId: string) {
-    const recorder = this.recorders.get(sessionId);
-    if (recorder) {
-      console.log(`🛑 Stopping recording for session ${sessionId} (socket ${socketId} disconnected)`);
-      try {
-        await recorder.stop();
-        this.recorders.delete(sessionId);
-        console.log(`✅ Recording stopped and cleaned up for session ${sessionId}`);
-      } catch (error) {
-        console.error(`❌ Error stopping recording for session ${sessionId}:`, error);
-        // Even if stop() fails, remove from map to prevent memory leak
-        this.recorders.delete(sessionId);
+    // Find all recorders for this socket in this session
+    const socketProducers = Array.from(this.producerToSocket.entries())
+      .filter(([_, sockId]) => sockId === socketId)
+      .map(([producerId]) => producerId);
+    
+    let stoppedAny = false;
+    for (const producerId of socketProducers) {
+      const recorderKey = `${sessionId}:${producerId}`;
+      const recorder = this.recorders.get(recorderKey);
+      if (recorder) {
+        console.log(`🛑 Stopping recording for session ${sessionId}, producer ${producerId} (socket ${socketId} disconnected)`);
+        try {
+          await recorder.stop();
+          this.recorders.delete(recorderKey);
+          console.log(`✅ Recording stopped and cleaned up for session ${sessionId}, producer ${producerId}`);
+          stoppedAny = true;
+        } catch (error) {
+          console.error(`❌ Error stopping recording for session ${sessionId}, producer ${producerId}:`, error);
+          // Even if stop() fails, remove from map to prevent memory leak
+          this.recorders.delete(recorderKey);
+          stoppedAny = true;
+        }
       }
-    } else {
-      console.log(`ℹ️ No active recorder found for session ${sessionId}`);
+    }
+    
+    // Clean up producer tracking for this socket
+    for (const [producerId, sockId] of this.producerToSocket.entries()) {
+      if (sockId === socketId) {
+        this.producerToSocket.delete(producerId);
+      }
+    }
+    
+    if (!stoppedAny) {
+      console.log(`ℹ️ No active recorder found for session ${sessionId}, socket ${socketId}`);
     }
     
     // Clean up pending recording starts

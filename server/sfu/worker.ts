@@ -2,10 +2,19 @@ import * as mediasoup from "mediasoup";
 import os from "os";
 
 export async function createMediasoupWorker() {
+  const rtcMinPort = process.env.MEDIASOUP_RTC_MIN_PORT 
+    ? parseInt(process.env.MEDIASOUP_RTC_MIN_PORT, 10) 
+    : 40000;
+  const rtcMaxPort = process.env.MEDIASOUP_RTC_MAX_PORT 
+    ? parseInt(process.env.MEDIASOUP_RTC_MAX_PORT, 10) 
+    : 49999;
+
+  console.log(`🔌 Mediasoup RTC port range: ${rtcMinPort}-${rtcMaxPort}`);
+
   const worker = await mediasoup.createWorker({
     logLevel: "warn",
-    rtcMinPort: 40000,
-    rtcMaxPort: 49999,
+    rtcMinPort,
+    rtcMaxPort,
     dtlsCertificateFile: undefined,
     dtlsPrivateKeyFile: undefined,
   });

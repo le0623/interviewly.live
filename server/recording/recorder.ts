@@ -42,6 +42,11 @@ export class RecordingService {
     this.candidateInfo = candidateInfo;
   }
 
+  setAudioProducer(audioProducer: MediasoupTypes.Producer) {
+    this.audioProducer = audioProducer;
+    console.log(`🎤 Audio producer set for session ${this.sessionId}: ${audioProducer.id}`);
+  }
+
   async start() {
     if (this.isRecording) {
       return;
@@ -50,24 +55,40 @@ export class RecordingService {
     try {
       const router = this.router.getRouter();
 
-      // Get all producers from the router
-      const producers = this.router.getAllProducers();
-      const videoProd = producers.find((p) => p.kind === "video");
-      const audioProd = producers.find((p) => p.kind === "audio");
-
-      if (!videoProd) {
-        throw new Error("Video producer not found");
+      // Use the specific video producer that was passed in the constructor
+      // This ensures we record the correct candidate's stream, not just any video producer
+      if (!this.videoProducerInstance) {
+        throw new Error("Video producer instance not set");
       }
 
-      this.videoProducerInstance = videoProd;
-      this.audioProducer = audioProd || null;
+      // Check if audio producer was already set (by signaling server before calling start())
+      // If not set, we need to find it, but this should rarely happen
+      if (!this.audioProducer) {
+        console.warn(`⚠️ Audio producer not pre-set for session ${this.sessionId}, searching for it...`);
+        
+        // Find the audio producer that belongs to the same transport as the video producer
+        // This is a fallback - normally the signaling server should set it before calling start()
+        const allProducers = this.router.getAllProducers();
+        const audioProducers = allProducers.filter((p) => p.kind === "audio");
+        
+        if (audioProducers.length === 1) {
+          this.audioProducer = audioProducers[0];
+        } else if (audioProducers.length > 1) {
+          // Multiple audio producers - this is problematic
+          // We can't reliably match without transport information
+          console.error(`❌ Multiple audio producers found (${audioProducers.length}) but no audio producer was pre-set. Cannot determine which one to use.`);
+          // Don't set audioProducer - recording will proceed without audio
+        }
+      }
+      
+      console.log(`📹 Using video producer: ${this.videoProducerInstance.id}, Audio producer: ${this.audioProducer?.id || 'none'}`);
 
       // Allocate ports for FFmpeg to receive RTP
-      // Each session gets unique ports based on sessionId hash
-      // This allows multiple concurrent recordings without port conflicts
-      // Hash-based allocation ensures same sessionId always gets same ports (useful for reconnection)
+      // Use producer ID to ensure unique ports per recording instance
+      // This allows multiple concurrent recordings in the same session without port conflicts
+      const uniqueId = `${this.sessionId}:${this.videoProducerInstance.id}`;
       const stableHash =
-        [...this.sessionId].reduce((acc, ch) => (acc * 31 + ch.charCodeAt(0)) >>> 0, 0) %
+        [...uniqueId].reduce((acc, ch) => (acc * 31 + ch.charCodeAt(0)) >>> 0, 0) %
         20000;
       let basePort = 40000 + stableHash;
       if (basePort % 2 === 1) basePort += 1; // Ensure even port for RTP
@@ -121,8 +142,8 @@ export class RecordingService {
       // Now start FFmpeg with the RTP parameters we got from consumers
       await this.startFFmpegRecording();
 
-      // Give FFmpeg a moment to bind sockets
-      await new Promise((resolve) => setTimeout(resolve, 500));
+      // Give FFmpeg more time to bind sockets and initialize
+      await new Promise((resolve) => setTimeout(resolve, 2000));
 
       // NOW connect the transport to FFmpeg's RTP ports
       // This tells mediasoup where to send RTP packets
@@ -143,6 +164,9 @@ export class RecordingService {
         console.log(`✅ Audio transport connected, RTP will be sent to port ${this.ffmpegRtpPorts.audio}`);
       }
 
+      // Give transport a moment to establish connection
+      await new Promise((resolve) => setTimeout(resolve, 500));
+
       // Start media flowing only after transports are connected and FFmpeg is ready.
       if (this.videoConsumer) {
         await this.videoConsumer.resume();
@@ -151,6 +175,8 @@ export class RecordingService {
         if (typeof (this.videoConsumer as any).requestKeyFrame === "function") {
           (this.videoConsumer as any).requestKeyFrame();
         }
+        // Wait a bit for keyframe to arrive before FFmpeg tries to write header
+        await new Promise((resolve) => setTimeout(resolve, 1000));
       }
       if (this.audioConsumer) {
         await this.audioConsumer.resume();
@@ -231,8 +257,8 @@ export class RecordingService {
       "-hide_banner",
       "-loglevel", "info",
       "-protocol_whitelist", "file,udp,rtp",
-      "-analyzeduration", "5000000", // 5 seconds - give FFmpeg time to analyze RTP stream
-      "-probesize", "5000000", // 5MB - probe size for RTP
+      "-analyzeduration", "10000000", // 10 seconds - give FFmpeg more time to analyze RTP stream and get dimensions
+      "-probesize", "10000000", // 10MB - larger probe size for RTP to ensure dimensions are detected
       "-fflags", "+genpts",
       "-i", this.sdpPath, // Use SDP file for input
       "-map", "0:v", // Map video stream
@@ -246,6 +272,7 @@ export class RecordingService {
       "-f", "matroska", // Use Matroska container (more flexible than WebM for RTP)
       "-fflags", "+genpts+igndts", // Generate timestamps, ignore DTS
       "-avoid_negative_ts", "make_zero", // Handle negative timestamps
+      "-flush_packets", "1", // Flush packets immediately to avoid buffering issues
       "-y", // Overwrite output file
       this.filePath,
     ];
@@ -265,7 +292,16 @@ export class RecordingService {
       const message = data.toString();
       // Log all FFmpeg output for debugging
       if (message.trim()) {
-        console.log(`FFmpeg: ${message.trim()}`);
+        const trimmed = message.trim();
+        console.log(`FFmpeg: ${trimmed}`);
+        
+        // Check for critical errors
+        if (trimmed.includes("dimensions not set") || trimmed.includes("Could not write header")) {
+          console.error("❌ FFmpeg error: Video dimensions not available. This usually means:");
+          console.error("   1. FFmpeg hasn't received any RTP packets yet");
+          console.error("   2. Video producer is not sending data");
+          console.error("   3. Transport connection issue");
+        }
       }
     });
 
@@ -294,9 +330,14 @@ export class RecordingService {
     });
 
     // Wait a bit for FFmpeg to start and bind to ports
-    await new Promise((resolve) => setTimeout(resolve, 2000));
+    await new Promise((resolve) => setTimeout(resolve, 1000));
     
-    console.log(`⏳ Waiting for FFmpeg to bind to ports and start receiving RTP...`);
+    console.log(`⏳ FFmpeg started, waiting for RTP streams...`);
+    
+    // Verify FFmpeg process is still running
+    if (!this.ffmpegProcess || this.ffmpegProcess.killed) {
+      throw new Error("FFmpeg process failed to start");
+    }
   }
 
   private generateSDP(

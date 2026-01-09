@@ -1,0 +1,14 @@
+node_modules
+.next
+.git
+.gitignore
+README.md
+TROUBLESHOOTING.md
+.env.local
+.env*.local
+*.log
+.DS_Store
+.vscode
+.idea
+uploads/*
+!uploads/.gitkeep

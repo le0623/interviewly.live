@@ -33,11 +33,18 @@ export class SFURouter {
   async createWebRtcTransport(sessionId: string) {
     const router = this.getRouter();
 
+    // In Docker, we need to listen on 0.0.0.0 to accept connections from outside the container
+    // The announcedIp should be the public IP or domain that clients can reach
+    const listenIp = process.env.MEDIASOUP_LISTEN_IP || "0.0.0.0";
+    const announcedIp = process.env.MEDIASOUP_ANNOUNCED_IP || undefined;
+    
+    console.log(`🌐 Creating WebRTC transport - listenIp: ${listenIp}, announcedIp: ${announcedIp || 'auto-detect'}`);
+    
     const transport = await router.createWebRtcTransport({
       listenIps: [
         {
-          ip: "127.0.0.1",
-          announcedIp: process.env.MEDIASOUP_ANNOUNCED_IP || undefined,
+          ip: listenIp,
+          announcedIp: announcedIp,
         },
       ],
       enableUdp: true,

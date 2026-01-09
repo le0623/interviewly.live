@@ -59,7 +59,8 @@ app.prepare().then(async () => {
   const signalingServer = new SignalingServer(io, worker);
 
   // Start the combined server
-  httpServer.listen(port, () => {
+  // Bind to hostname (0.0.0.0 in Docker) to accept connections from outside the container
+  httpServer.listen(port, hostname, () => {
     console.log(`🚀 Next.js app running on http://${hostname}:${port}`);
     console.log(`🚀 SFU Server running on port ${port} (same server)`);
     console.log(`📡 WebSocket signaling available at ws://${hostname}:${port}/socket.io`);
